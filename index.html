@@ -35,17 +35,23 @@ async function joinGame(){
   const sref=ref(db,'sessions/'+code); const snap=await get(sref); if(!snap.exists()) throw new Error('Partie introuvable.');
   const sess=snap.val(); if(sess.status!=='lobby') throw new Error('Cette partie a déjà commencé.');
   playerId=crypto.randomUUID(); let assigned=-1;
-  const result=await runTransaction(sref,current=>{
-   if(!current||current.status!=='lobby') return;
-   current.players=current.players||{}; current.usedRoles=current.usedRoles||{};
-   const used=new Set(Object.keys(current.usedRoles).map(Number)); const available=[]; for(let i=0;i<roles.length;i++) if(!used.has(i)) available.push(i);
-   if(!available.length) return;
-   assigned=available[Math.floor(Math.random()*available.length)];
-   current.usedRoles[assigned]=playerId;
-   current.players[playerId]={name,roleIndex:assigned,score:0,lastAnswered:-1,lastChoice:'',online:true,joinedAt:Date.now()};
-   return current;
-  });
-  if(!result.committed||assigned<0) throw new Error('Impossible de rejoindre : partie complète ou déjà lancée.');
+  // Reserve un role atomiquement. Cela evite la transaction sur toute la session,
+  // qui pouvait etre annulee quand plusieurs clients rejoignaient en meme temps.
+  const used=Object.keys(sess.usedRoles||{}).map(Number);
+  const candidates=[]; for(let i=0;i<roles.length;i++) if(!used.includes(i)) candidates.push(i);
+  while(candidates.length && assigned<0){
+   const pos=Math.floor(Math.random()*candidates.length); const candidate=candidates.splice(pos,1)[0];
+   const reserve=await runTransaction(ref(db,`sessions/${code}/usedRoles/${candidate}`),current=>current===null?playerId:undefined);
+   if(reserve.committed) assigned=candidate;
+  }
+  if(assigned<0) throw new Error('Impossible de rejoindre : tous les roles sont deja attribues.');
+  // Verifie une derniere fois que la partie est toujours en attente puis cree le joueur.
+  const check=await get(sref);
+  if(!check.exists()||check.val().status!=='lobby'){
+   await set(ref(db,`sessions/${code}/usedRoles/${assigned}`),null);
+   throw new Error('Impossible de rejoindre : la partie a deja commence.');
+  }
+  await set(ref(db,`sessions/${code}/players/${playerId}`),{name,roleIndex:assigned,score:0,lastAnswered:-1,lastChoice:'',online:true,joinedAt:Date.now()});
   sessionCode=code; roleIndex=assigned; localStorage.setItem('upa_current',JSON.stringify({code,playerId,name,roleIndex}));
   await onDisconnect(ref(db,`sessions/${code}/players/${playerId}/online`)).set(false);
   el('waitingCode').textContent=code; el('gameCode').textContent=code; el('waitingName').textContent=name; el('roleText').textContent=roles[roleIndex]; show('waitingCard'); listen();
